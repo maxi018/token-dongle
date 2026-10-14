@@ -35,6 +35,18 @@ El panel usa offsets 26/1, inversión de color ON y orden BGR (así lo configura
   (16 MB flash QIO, 8 MB PSRAM, partición `default_16MB.csv`).
 - `ARDUINO_USB_MODE=1` + `ARDUINO_USB_CDC_ON_BOOT=1` → `Serial` va por el USB Serial/JTAG.
 
+## Firmware precompilado
+
+`prebuilt/token-dongle-c5-factory.bin` es la imagen completa (bootloader + particiones + app)
+para grabar en `0x0`. Se genera con `pio run` (es `.pio/build/t-dongle-c5/firmware.factory.bin`):
+
+```bash
+~/.venvs/esptool/bin/esptool --chip esp32c5 --port /dev/ttyACM0 write-flash 0x0 prebuilt/token-dongle-c5-factory.bin
+(cd prebuilt && sha256sum -c token-dongle-c5-factory.bin.sha256)   # opcional: verificar el archivo
+```
+
+Si cambiás el código, regenerala con `pio run` y copiá el `.factory.bin` encima.
+
 ## Compilar y flashear
 
 Necesitás PlatformIO Core (o la extensión de VS Code):

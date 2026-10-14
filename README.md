@@ -25,16 +25,86 @@ lee `ccusage` y manda los datos por serial a la pantalla TFT, con el LED RGB com
 | [`firmware/`](firmware/README.md) | Proyecto PlatformIO para el dongle |
 | [`statusline/`](statusline/README.md) | Status line de Claude Code que pasa los límites 5h/semana (opcional) |
 
-## Arranque rápido
+## Qué necesitás
+
+- Un **[LILYGO T-Dongle-C5](https://www.lilygo.cc/products/t-dongle-c5)** (ESP32-C5, el de pantalla 0.96").
+  Ojo: **no** sirve el T-Dongle-S3, tiene otros pines.
+- Una PC con **Linux** (probado en Debian 13; en cualquier distro con systemd debería andar).
+- **Claude Code** instalado y usado en esa PC (de ahí salen los datos).
+- Para las barras de límites: plan **Pro o Max** (opcional; sin eso funciona todo lo demás).
+
+## Instalación desde cero
+
+### 1. Clonar el repo
 
 ```bash
-# 1. Firmware
-cd firmware && pio run -t upload --upload-port /dev/ttyACM0
-
-# 2. Daemon
-sudo apt install python3-serial && npm i -g ccusage
-cd ../daemon && ./claude_token_daemon.py -v
+git clone https://github.com/maxi018/token-dongle ~/token-dongle
+cd ~/token-dongle
 ```
+
+> Clonalo en `~/token-dongle`: el servicio systemd usa esa ruta. Si lo ponés en otro lado,
+> editá `ExecStart` en `daemon/claude-token-monitor.service`.
+
+### 2. Dependencias de la PC
+
+```bash
+sudo apt install git python3 python3-venv python3-serial nodejs npm
+sudo npm install -g ccusage
+sudo usermod -aG dialout "$USER"      # después cerrá sesión y volvé a entrar
+sudo cp daemon/99-t-dongle-c5.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+```
+
+### 3. Flashear el dongle
+
+Enchufalo y buscá el puerto con `ls -l /dev/serial/by-id/` (suele ser `/dev/ttyACM0`).
+
+**Opción A: firmware precompilado (lo más fácil)**
+
+```bash
+python3 -m venv ~/.venvs/esptool && ~/.venvs/esptool/bin/pip install esptool
+~/.venvs/esptool/bin/esptool --chip esp32c5 --port /dev/ttyACM0 \
+    write-flash 0x0 firmware/prebuilt/token-dongle-c5-factory.bin
+```
+
+**Opción B: compilarlo vos** (si querés tocar el código): ver [`firmware/README.md`](firmware/README.md).
+
+Si no engancha: desenchufalo, mantené **BOOT** apretado, enchufalo, soltá y repetí.
+Al terminar, desenchufá y volvé a enchufar. Tenés que ver el LED **rojo → verde → azul**
+y a Clawd durmiendo con "esperando PC...".
+
+### 4. Arrancar el daemon
+
+```bash
+./daemon/claude_token_daemon.py -v
+```
+
+A los ~10 segundos aparece tu consumo de hoy. Si funciona, dejalo como servicio para no
+tener que acordarte más (arranca solo al iniciar sesión):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp daemon/claude-token-monitor.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now claude-token-monitor
+```
+
+### 5. (Opcional) Barras de límites 5h / semanal
+
+```bash
+python3 statusline/install.py
+```
+
+Abrí Claude Code, mandá un mensaje y en unos segundos aparecen las barras.
+Detalles en [`statusline/README.md`](statusline/README.md).
+
+### Si algo falla
+
+| Síntoma | Solución |
+|---|---|
+| `Permission denied` en el puerto | no cerraste sesión después del `usermod` (chequeá con `groups`) |
+| `Device or resource busy` | otro programa tiene el puerto: frená el daemon (`systemctl --user stop claude-token-monitor`) |
+| Imagen dada vuelta | cambiá `TFT_ROTATION` a `3` en `firmware/src/main.cpp` y compilá (opción B) |
+| Queda en "esperando PC" | corré el daemon con `-v` y fijate qué dice |
+| Muestra 0 tokens | es normal si hoy todavía no usaste Claude Code en esta PC |
 
 ## Protocolo PC → dongle
 
@@ -99,10 +169,19 @@ El botón **BOOT** del dongle cicla el LED: normal → tenue → apagado.
 ## Hardware: dos cosas a saber
 
 1. **El LED es un APA102, no un WS2812B.** Tiene clock (GPIO4) + data (GPIO5). Las libs de
-   WS2812/NeoPixel no lo van a prender; en la fase 2 se maneja con APA102/SPI.
+   WS2812/NeoPixel no lo van a prender; el firmware lo maneja con un driver propio (`src/led.h`).
 2. **Los pines no son los del T-Dongle-S3.** Están verificados contra el repo oficial
    [`Xinyuan-LilyGO/T-Dongle-C5`](https://github.com/Xinyuan-LilyGO/T-Dongle-C5); detalle en
    [`firmware/README.md`](firmware/README.md).
+
+## Créditos y aclaraciones
+
+- **Proyecto no oficial**, hecho por fans: no tiene relación con Anthropic ni con LilyGO.
+  Claude, Claude Code y Clawd son de Anthropic; Clawd está dibujado a partir del logo ASCII del CLI.
+- `firmware/boards/lilygo-t-dongle-c5.json` y el pinout salen del repo oficial
+  [Xinyuan-LilyGO/T-Dongle-C5](https://github.com/Xinyuan-LilyGO/T-Dongle-C5).
+- Datos de consumo: [ccusage](https://github.com/ccusage/ccusage).
+- Licencia: [MIT](LICENSE).
 
 ## Roadmap
 
