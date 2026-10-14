@@ -7,7 +7,15 @@ ESP32-C5) como una línea JSON:
 
     {"v":1,"day_tokens":591725,"date":"2026-10-14","lvl":0.42}
 
-`lvl` es la fracción del presupuesto diario ya consumida (semáforo del LED).
+`lvl` maneja el semáforo del LED y el humor de Clawd (0.6 = amarillo, 1.0 = rojo).
+
+Si está instalada la status line de statusline/dongle_statusline.py, además manda los
+límites oficiales de la cuenta (Pro/Max) que Claude Code guarda en
+~/.cache/token-dongle/limits.json:
+
+    "s5": 23, "s7": 41    % usado de la ventana de 5 h y de la semanal
+    "r5": 7800            segundos hasta que resetea la ventana de 5 h
+    "lim_age": 120        segundos desde que Claude Code actualizó esos datos
 
 Estructura de `ccusage daily --json` verificada con ccusage 20.0.31:
 
@@ -23,6 +31,7 @@ import argparse
 import datetime as dt
 import json
 import logging
+import os
 import shlex
 import shutil
 import signal
@@ -99,6 +108,50 @@ def fetch_today(base_cmd: list[str], offline: bool, timeout: float, budget_usd: 
     return payload
 
 
+# ---------------------------------------------------------------------- límites
+
+DEFAULT_LIMITS_FILE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "token-dongle", "limits.json"
+)
+# Con los límites reales el LED se pone rojo al 90%: al 100% Claude ya te frena.
+LIMIT_RED_AT = 90.0
+
+
+def read_limits(path: str, now: float | None = None) -> dict | None:
+    """Lee los límites que dejó la status line. None si nunca se guardaron."""
+    now = time.time() if now is None else now
+    try:
+        with open(path) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+
+    out: dict = {}
+    for name, key in (("five_hour", "s5"), ("seven_day", "s7")):
+        w = saved.get(name)
+        if not isinstance(w, dict):
+            continue
+        resets_at = int(w.get("resets_at") or 0)
+        expired = resets_at and resets_at <= now
+        # Ventana vencida = arrancó una nueva; sin uso visto todavía, vale 0%.
+        out[key] = 0 if expired else round(float(w.get("used_percentage", 0)))
+        if name == "five_hour" and resets_at and not expired:
+            out["r5"] = int(resets_at - now)
+    if not out:
+        return None
+    out["lim_age"] = max(0, int(now - int(saved.get("updated_at") or now)))
+    return out
+
+
+def apply_limits(payload: dict, limits: dict | None, led_source: str) -> None:
+    if not limits:
+        return
+    payload.update(limits)
+    if led_source == "limits":
+        worst = max(limits.get("s5", 0), limits.get("s7", 0))
+        payload["lvl"] = round(worst / LIMIT_RED_AT, 3)
+
+
 # ---------------------------------------------------------------------- serial
 
 
@@ -173,6 +226,10 @@ def main() -> int:
                     help="presupuesto diario en USD para el semáforo (default 50; 0 = no usar)")
     ap.add_argument("--budget-tokens", type=int, default=0,
                     help="presupuesto diario en tokens para el semáforo (default 0 = no usar)")
+    ap.add_argument("--limits-file", default=DEFAULT_LIMITS_FILE,
+                    help="archivo que escribe la status line con los límites 5h/semana")
+    ap.add_argument("--led-source", choices=("limits", "budget"), default="limits",
+                    help="qué maneja el semáforo: los límites reales (default, si hay datos) o el presupuesto")
     ap.add_argument("--dry-run", action="store_true", help="no abre el serial, solo imprime el payload")
     ap.add_argument("--once", action="store_true", help="una sola vuelta y sale")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -201,11 +258,18 @@ def main() -> int:
         payload = None
         try:
             payload = fetch_today(base_cmd, args.offline, args.timeout, args.budget_usd, args.budget_tokens)
+            apply_limits(payload, read_limits(args.limits_file), args.led_source)
             lvl = payload.get("lvl")
+            limits_txt = (
+                f" | límites: 5h {payload['s5']}% · semana {payload['s7']}%"
+                if "s5" in payload and "s7" in payload
+                else ""
+            )
             log.info(
-                "hoy: %s tokens%s",
+                "hoy: %s tokens%s%s",
                 f"{payload['day_tokens']:,}".replace(",", "."),
-                f" ({lvl:.0%} del presupuesto)" if lvl is not None else "",
+                f" (semáforo {lvl:.0%})" if lvl is not None else "",
+                limits_txt,
             )
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
             # No mandamos nada: el dongle mantiene el último número y su

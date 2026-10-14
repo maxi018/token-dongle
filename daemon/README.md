@@ -42,6 +42,8 @@ sudo udevadm control --reload && sudo udevadm trigger
 | `--timeout` | `90` | timeout de cada corrida de ccusage |
 | `--budget-usd` | `50` | presupuesto diario en USD para el semáforo (`0` = no usar) |
 | `--budget-tokens` | `0` | presupuesto diario en tokens (`0` = no usar). Si usás los dos, manda el más exigido |
+| `--limits-file` | `~/.cache/token-dongle/limits.json` | de dónde leer los límites que guarda la status line |
+| `--led-source` | `limits` | qué maneja el semáforo: `limits` (los reales, si hay datos) o `budget` |
 | `--dry-run` | off | imprime el payload en vez de mandarlo |
 | `--once` | off | una vuelta y sale |
 | `-v` | off | logs de debug (incluye lo que responde el dongle) |
@@ -73,11 +75,13 @@ carpeta en la línea `Environment=PATH=...` o pasá la ruta absoluta con `--ccus
 Una línea JSON por actualización (ver el README general para el protocolo):
 
 ```json
-{"v":1,"day_tokens":1640234,"date":"2026-10-14","lvl":0.156}
+{"v":1,"day_tokens":1640234,"date":"2026-10-14","lvl":0.456,"s5":24,"r5":7772,"s7":41,"lim_age":27}
 ```
 
-`lvl` = costo de hoy / `--budget-usd` (y/o tokens / `--budget-tokens`). Con 0.6 el LED ya está
-amarillo y con 1.0 rojo. El costo es el **equivalente en API** que calcula ccusage: si tenés plan
+`s5`/`s7`/`r5`/`lim_age` aparecen solo si instalaste la [status line](../statusline/README.md).
+
+`lvl`: si hay límites, es el peor de los dos dividido 90 (rojo al 90%). Si no, es costo de hoy /
+`--budget-usd` (y/o tokens / `--budget-tokens`). Con 0.6 el LED ya está amarillo y con 1.0 rojo. El costo es el **equivalente en API** que calcula ccusage: si tenés plan
 Pro/Max no es lo que pagás, pero sirve igual como termómetro.
 
 `day_tokens` es el `totalTokens` de la fila de hoy de `ccusage daily --json`

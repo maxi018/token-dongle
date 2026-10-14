@@ -4,7 +4,11 @@
 //
 // Protocolo (una línea por mensaje, terminada en '\n'):
 //   {"v":1,"day_tokens":591725,"date":"2026-10-14","lvl":0.42}
-// lvl = fracción del presupuesto diario consumida (la calcula el daemon; puede pasar de 1).
+// lvl = qué tan cerca estás del límite (la calcula el daemon; 0.6 amarillo, 1.0 rojo).
+// Opcionales, si la status line de Claude Code está instalada (límites oficiales Pro/Max):
+//   "s5":23,"s7":41   % usado de la ventana de 5 h y de la semanal
+//   "r5":7800         segundos hasta que resetea la de 5 h
+//   "lim_age":120     antigüedad de esos datos en segundos
 // Las claves desconocidas se ignoran.
 
 #include <Arduino.h>
@@ -35,6 +39,9 @@ static const size_t RX_LINE_MAX = 512;
 // Umbrales del semáforo (fracción del presupuesto diario)
 static const float LVL_YELLOW = 0.6f;
 static const float LVL_RED = 1.0f;
+// Las barras de límites se pintan de gris si los datos tienen más de esto
+// (Claude Code solo los actualiza mientras lo usás).
+static const uint32_t LIMITS_OLD_AFTER_S = 30 * 60;
 
 SPIClass &lcdSpi = SPI;
 Adafruit_ST7735 tft(&lcdSpi, PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST);
@@ -50,6 +57,10 @@ struct State {
   uint32_t lastRxMs = 0;
   uint32_t lastActivityMs = 0;
   bool everActive = false;
+  // Límites oficiales (vía status line). < 0 = desconocido.
+  int16_t s5 = -1, s7 = -1;
+  int32_t r5 = -1;       // segundos hasta el reset de 5 h, al momento de recibirlo
+  uint32_t limAge = 0;   // antigüedad de los límites al momento de recibirlos
 } state;
 
 enum class LedMode : uint8_t { Normal, Dim, Off };
@@ -128,6 +139,33 @@ static void drawTokens(uint64_t n, int16_t x0, int16_t maxW, int16_t baselineY) 
   canvas.setFont(nullptr);
 }
 
+static uint16_t pctColor(int pct) {
+  return pct >= 90 ? ST77XX_RED : pct >= 60 ? ST77XX_YELLOW : ST77XX_GREEN;
+}
+
+// Barrita "5h [=====     ] 42%". `old` = datos viejos, se pinta en gris.
+static void drawLimitBar(const char *label, int16_t pct, int16_t x, int16_t y, bool old) {
+  const int16_t barX = x + 20, barW = 50, barH = 7;
+  canvas.setFont(nullptr);
+  canvas.setTextSize(1);
+  canvas.setTextColor(0xAD55);
+  canvas.setCursor(x, y);
+  canvas.print(label);
+  canvas.drawRect(barX, y, barW, barH, 0x630C);
+  char txt[8];
+  if (pct < 0) {
+    snprintf(txt, sizeof(txt), "--");
+  } else {
+    int16_t fillW = (int16_t)((barW - 2) * (pct > 100 ? 100 : pct) / 100);
+    uint16_t c = old ? 0x7BEF : pctColor(pct);
+    canvas.fillRect(barX + 1, y + 1, fillW, barH - 2, c);
+    snprintf(txt, sizeof(txt), "%d%%", pct);
+  }
+  canvas.setTextColor(old || pct < 0 ? 0x7BEF : pctColor(pct));
+  canvas.setCursor(canvas.width() - (int16_t)strlen(txt) * 6 - 2, y);
+  canvas.print(txt);
+}
+
 static ClawdMood currentMood(uint32_t now) {
   if (!state.hasData || isStale(now)) return ClawdMood::Sleeping;
   if (state.lvl >= LVL_RED) return ClawdMood::Panic;
@@ -157,12 +195,19 @@ static void render(uint32_t now) {
   // Clawd a la izquierda
   drawClawd(canvas, 3, 22, currentMood(now), now);
 
-  // Número a la derecha
+  // Número a la derecha (más arriba si hay barras de límites debajo)
   const int16_t numX = CLAWD_W + 6;
   const int16_t numW = canvas.width() - numX - 2;
+  const bool showLimits = state.hasData && (state.s5 >= 0 || state.s7 >= 0);
   canvas.setTextColor(ST77XX_WHITE);
   if (state.hasData) {
-    drawTokens(state.dayTokens, numX, numW, 52);
+    drawTokens(state.dayTokens, numX, numW, showLimits ? 40 : 52);
+    if (showLimits) {
+      uint32_t ageS = state.limAge + (now - state.lastRxMs) / 1000;
+      bool old = ageS > LIMITS_OLD_AFTER_S;
+      drawLimitBar("5h", state.s5, numX, 47, old);
+      drawLimitBar("sem", state.s7, numX, 58, old);
+    }
   } else {
     canvas.setFont(&FreeSansBold9pt7b);
     const char *l1 = "esperando", *l2 = "PC...";
@@ -190,7 +235,15 @@ static void render(uint32_t now) {
   canvas.setTextColor(footColor);
   canvas.setCursor(2, 71);
   canvas.print(foot);
-  if (state.hasData && state.lvl >= 0) {
+  int32_t resetS = state.r5 >= 0 ? state.r5 - (int32_t)((now - state.lastRxMs) / 1000) : -1;
+  if (showLimits && resetS > 0) {
+    // Cuándo se libera la ventana de 5 h
+    char rs[16];
+    snprintf(rs, sizeof(rs), "reset %ldh%02ldm", (long)(resetS / 3600), (long)((resetS % 3600) / 60));
+    canvas.setTextColor(0x8410);
+    canvas.setCursor(canvas.width() - (int16_t)strlen(rs) * 6 - 2, 71);
+    canvas.print(rs);
+  } else if (state.hasData && state.lvl >= 0 && !showLimits) {
     char pct[12];
     snprintf(pct, sizeof(pct), "%d%%", (int)(state.lvl * 100.0f + 0.5f));
     uint16_t c = state.lvl >= LVL_RED ? ST77XX_RED : state.lvl >= LVL_YELLOW ? ST77XX_YELLOW : ST77XX_GREEN;
@@ -304,6 +357,10 @@ static void handleLine(const char *line) {
   }
   state.dayTokens = newTokens;
   state.lvl = doc["lvl"] | -1.0f;
+  state.s5 = doc["s5"] | -1;
+  state.s7 = doc["s7"] | -1;
+  state.r5 = doc["r5"] | -1;
+  state.limAge = doc["lim_age"] | 0;
   strlcpy(state.date, date, sizeof(state.date));
   state.hasData = true;
   state.lastRxMs = now;
