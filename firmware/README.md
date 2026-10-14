@@ -85,16 +85,31 @@ stty -F /dev/ttyACM0 raw -echo
 echo '{"v":1,"day_tokens":1234567,"date":"2026-10-14"}' > /dev/ttyACM0
 ```
 
-## Pantalla (Fase 1)
+Para ver todos los humores de Clawd y colores del LED, mandá distintos `lvl` y subí `day_tokens`:
 
+```bash
+P=/dev/ttyACM0
+echo '{"v":1,"day_tokens":1000000,"date":"2026-10-14","lvl":0.2}'  > $P; sleep 3   # verde, tranqui
+echo '{"v":1,"day_tokens":1500000,"date":"2026-10-14","lvl":0.3}'  > $P; sleep 5   # flash + camina
+echo '{"v":1,"day_tokens":1500000,"date":"2026-10-14","lvl":0.75}' > $P; sleep 14  # amarillo, suda
+echo '{"v":1,"day_tokens":1500000,"date":"2026-10-14","lvl":1.3}'  > $P            # rojo, pánico
 ```
-┌────────────────────────────────┐
-│TOKENS HOY                 14/10│
-│────────────────────────────────│
-│          1.640.234             │  ← la fuente se achica sola si no entra
-│                                │
-│     actualizado hace 4s        │  ← en rojo "SIN DATOS hace Xs" si pasan >35s
-└────────────────────────────────┘
-```
+
+## Pantalla
+
+![Estados de la pantalla](../docs/preview.png)
+
+- Arriba: `TOKENS HOY` y la fecha.
+- Izquierda: **Clawd** (`src/clawd.cpp`), sacado del logo ASCII del CLI y animado según el humor.
+- Derecha: el total. Usa la combinación más legible que entre: `8.765` → `1,64M` → `123M`.
+- Abajo: hace cuánto llegó el último dato (en rojo `SIN DATOS` si pasan >35 s) y el % del presupuesto.
+
+## LED (APA102)
+
+- `src/led.h`: driver bit-bang de 30 líneas, sin librerías (DI = GPIO5, CI = GPIO4).
+- Al arrancar hace un **autotest: ROJO → VERDE → AZUL**. Si ves otro orden, avisá y se ajusta el
+  orden de bytes en `Apa102Led::set()`.
+- Brillo bajo a propósito (6/31): el LED encandila. Lo cambiás en `updateLed()`.
+- Botón **BOOT**: normal → tenue → apagado.
 
 Si la imagen te queda dada vuelta según cómo enchufes el dongle, cambiá `TFT_ROTATION` a `3` en `src/main.cpp`.

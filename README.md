@@ -15,6 +15,10 @@ lee `ccusage` y manda los datos por serial a la pantalla TFT, con el LED RGB com
 - **Sin USB-HID**: el ESP32-C5 solo tiene USB Serial/JTAG, así que todo va por serie (CDC).
 - **Sin API key**: `ccusage` lee los logs locales de Claude Code.
 
+![Pantalla simulada en sus distintos estados](docs/preview.png)
+
+*Render de la pantalla (160x80, ampliada) con la misma librería gráfica del firmware.*
+
 | Carpeta | Qué hay |
 |---|---|
 | [`daemon/`](daemon/README.md) | Script Python + servicio systemd + regla udev |
@@ -41,6 +45,7 @@ que no conoce, así que las fases nuevas pueden agregar campos sin romper firmwa
 | `v` | int | 1 | versión del protocolo (`1`) |
 | `day_tokens` | uint64 | 1 | total de tokens de hoy (`totalTokens` de `ccusage daily`) |
 | `date` | `"YYYY-MM-DD"` | 1 | día al que corresponde |
+| `lvl` | float | 2 | fracción del presupuesto diario consumida (`0.42` = 42%, puede pasar de 1). Opcional |
 
 Si pasan más de 35 s sin mensajes válidos, el dongle muestra **SIN DATOS** en rojo.
 
@@ -55,6 +60,20 @@ Verificado con **ccusage 20.0.31**:
 
 Ojo: en esta versión `daily` suma **todos** los agentes que detecta (campo `"agent":"all"`), no solo Claude Code.
 
+## Clawd y el semáforo
+
+| Estado | Clawd | LED |
+|---|---|---|
+| Sin datos todavía | duerme (zZ) | azul respirando |
+| Uso < 60% del presupuesto | tranqui, respira | verde → amarillo |
+| Entraron tokens nuevos | camina y salta ~12 s | flash blanco |
+| 60–100% | suda una gotita | amarillo → rojo |
+| ≥ 100% | tiembla y suda a mares | rojo latiendo rápido |
+| Daemon sin mandar > 35 s | duerme, pie "SIN DATOS" en rojo | violeta respirando |
+
+El presupuesto se configura en el daemon (`--budget-usd`, default 50; o `--budget-tokens`).
+El botón **BOOT** del dongle cicla el LED: normal → tenue → apagado.
+
 ## Hardware: dos cosas a saber
 
 1. **El LED es un APA102, no un WS2812B.** Tiene clock (GPIO4) + data (GPIO5). Las libs de
@@ -66,5 +85,6 @@ Ojo: en esta versión `daily` suma **todos** los agentes que detecta (campo `"ag
 ## Roadmap
 
 - [x] **Fase 1 (MVP)** — total de tokens del día en texto plano, actualizándose.
-- [ ] **Fase 2** — costo USD, burn rate y semáforo con el LED APA102.
+- [x] **Clawd** animado según el consumo + **semáforo** con el LED APA102.
+- [ ] **Fase 2** — costo USD y burn rate en pantalla.
 - [ ] **Fase 3** — barra de progreso de la ventana de 5 h y mini gráfico histórico.

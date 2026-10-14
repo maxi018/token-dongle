@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Claude Token Monitor — daemon de PC (Fase 1).
+"""Claude Token Monitor — daemon de PC.
 
 Cada N segundos corre `ccusage daily --json` para el día de hoy, saca el total
 de tokens y lo manda al T-Dongle-C5 por el puerto serie USB (USB Serial/JTAG del
 ESP32-C5) como una línea JSON:
 
-    {"v":1,"day_tokens":591725,"date":"2026-10-14"}
+    {"v":1,"day_tokens":591725,"date":"2026-10-14","lvl":0.42}
+
+`lvl` es la fracción del presupuesto diario ya consumida (semáforo del LED).
 
 Estructura de `ccusage daily --json` verificada con ccusage 20.0.31:
 
@@ -68,7 +70,17 @@ def run_ccusage(base_cmd: list[str], args: list[str], timeout: float) -> dict:
     return json.loads(out[start:])
 
 
-def fetch_today(base_cmd: list[str], offline: bool, timeout: float) -> dict:
+def budget_level(day_tokens: int, day_cost: float, budget_usd: float, budget_tokens: int) -> float | None:
+    """Fracción del presupuesto consumida; si hay dos presupuestos manda el más exigido."""
+    ratios = []
+    if budget_usd > 0:
+        ratios.append(day_cost / budget_usd)
+    if budget_tokens > 0:
+        ratios.append(day_tokens / budget_tokens)
+    return round(max(ratios), 3) if ratios else None
+
+
+def fetch_today(base_cmd: list[str], offline: bool, timeout: float, budget_usd: float, budget_tokens: int) -> dict:
     today = dt.date.today()
     args = ["daily", "--json", "--since", today.strftime("%Y%m%d"), "--until", today.strftime("%Y%m%d")]
     if offline:
@@ -78,7 +90,13 @@ def fetch_today(base_cmd: list[str], offline: bool, timeout: float) -> dict:
     iso = today.isoformat()
     rows = [r for r in data.get("daily", []) if r.get("period", r.get("date")) == iso]
     day_tokens = sum(int(r.get("totalTokens", 0)) for r in rows)
-    return {"v": PROTOCOL_VERSION, "day_tokens": day_tokens, "date": iso}
+    day_cost = sum(float(r.get("totalCost", 0.0)) for r in rows)
+    payload = {"v": PROTOCOL_VERSION, "day_tokens": day_tokens, "date": iso}
+    lvl = budget_level(day_tokens, day_cost, budget_usd, budget_tokens)
+    if lvl is not None:
+        payload["lvl"] = lvl
+    log.debug("costo de hoy: US$ %.2f", day_cost)
+    return payload
 
 
 # ---------------------------------------------------------------------- serial
@@ -151,6 +169,10 @@ def main() -> int:
     ap.add_argument("--ccusage-cmd", help='comando de ccusage (default: "ccusage" si está, si no "npx -y ccusage@latest")')
     ap.add_argument("--offline", action="store_true", help="pasa --offline a ccusage (precios cacheados, sin red)")
     ap.add_argument("--timeout", type=float, default=90.0, help="timeout de cada corrida de ccusage")
+    ap.add_argument("--budget-usd", type=float, default=50.0,
+                    help="presupuesto diario en USD para el semáforo (default 50; 0 = no usar)")
+    ap.add_argument("--budget-tokens", type=int, default=0,
+                    help="presupuesto diario en tokens para el semáforo (default 0 = no usar)")
     ap.add_argument("--dry-run", action="store_true", help="no abre el serial, solo imprime el payload")
     ap.add_argument("--once", action="store_true", help="una sola vuelta y sale")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -178,8 +200,13 @@ def main() -> int:
         t0 = time.monotonic()
         payload = None
         try:
-            payload = fetch_today(base_cmd, args.offline, args.timeout)
-            log.info("hoy: %s tokens", f"{payload['day_tokens']:,}".replace(",", "."))
+            payload = fetch_today(base_cmd, args.offline, args.timeout, args.budget_usd, args.budget_tokens)
+            lvl = payload.get("lvl")
+            log.info(
+                "hoy: %s tokens%s",
+                f"{payload['day_tokens']:,}".replace(",", "."),
+                f" ({lvl:.0%} del presupuesto)" if lvl is not None else "",
+            )
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
             # No mandamos nada: el dongle mantiene el último número y su
             # "SIN DATOS hace Xs" deja ver que algo anda mal.

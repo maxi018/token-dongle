@@ -7,7 +7,7 @@ After=default.target
 [Service]
 Type=simple
 # Ajustá la ruta si clonaste el repo en otro lado.
-ExecStart=/usr/bin/python3 %h/token-dongle/daemon/claude_token_daemon.py --offline
+ExecStart=/usr/bin/python3 %h/token-dongle/daemon/claude_token_daemon.py --offline --budget-usd 50
 # systemd no carga tu .bashrc: si node/ccusage viven en ~/.local/bin, nvm, etc., agregalos acá.
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1

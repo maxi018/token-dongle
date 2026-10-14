@@ -40,6 +40,8 @@ sudo udevadm control --reload && sudo udevadm trigger
 | `--ccusage-cmd` | `ccusage` / `bunx` / `npx` | comando a ejecutar, ej. `"npx -y ccusage@20"` |
 | `--offline` | off | `ccusage --offline`: precios cacheados, sin pegarle a internet |
 | `--timeout` | `90` | timeout de cada corrida de ccusage |
+| `--budget-usd` | `50` | presupuesto diario en USD para el semáforo (`0` = no usar) |
+| `--budget-tokens` | `0` | presupuesto diario en tokens (`0` = no usar). Si usás los dos, manda el más exigido |
 | `--dry-run` | off | imprime el payload en vez de mandarlo |
 | `--once` | off | una vuelta y sale |
 | `-v` | off | logs de debug (incluye lo que responde el dongle) |
@@ -71,8 +73,12 @@ carpeta en la línea `Environment=PATH=...` o pasá la ruta absoluta con `--ccus
 Una línea JSON por actualización (ver el README general para el protocolo):
 
 ```json
-{"v":1,"day_tokens":1640234,"date":"2026-10-14"}
+{"v":1,"day_tokens":1640234,"date":"2026-10-14","lvl":0.156}
 ```
+
+`lvl` = costo de hoy / `--budget-usd` (y/o tokens / `--budget-tokens`). Con 0.6 el LED ya está
+amarillo y con 1.0 rojo. El costo es el **equivalente en API** que calcula ccusage: si tenés plan
+Pro/Max no es lo que pagás, pero sirve igual como termómetro.
 
 `day_tokens` es el `totalTokens` de la fila de hoy de `ccusage daily --json`
 (input + output + cache creation + cache read).
