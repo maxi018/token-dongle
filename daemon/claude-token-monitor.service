@@ -1,0 +1,18 @@
+# Servicio systemd de USUARIO (no root): ccusage tiene que leer TU ~/.claude.
+# Instalación: ver daemon/README.md
+[Unit]
+Description=Claude Token Monitor (ccusage -> T-Dongle-C5 por serial)
+After=default.target
+
+[Service]
+Type=simple
+# Ajustá la ruta si clonaste el repo en otro lado.
+ExecStart=/usr/bin/python3 %h/token-dongle/daemon/claude_token_daemon.py --offline
+# systemd no carga tu .bashrc: si node/ccusage viven en ~/.local/bin, nvm, etc., agregalos acá.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

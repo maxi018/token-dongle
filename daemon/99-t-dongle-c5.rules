@@ -1,0 +1,5 @@
+# LILYGO T-Dongle-C5 (USB Serial/JTAG de Espressif, 303a:1001)
+# - symlink estable /dev/t-dongle-c5
+# - ModemManager no lo toca (si no, le manda comandos AT al dongle)
+# - acceso para el usuario logueado (uaccess) además del grupo dialout
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="t-dongle-c5", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
