@@ -1,7 +1,17 @@
-# Daemon de PC
+# Envío de datos (y daemon opcional)
 
-Script Python que cada 10 s corre `ccusage`, saca el total de tokens del día y lo manda al
-dongle por el puerto serie USB. Pensado para Debian 13, anda en cualquier Linux.
+`claude_token_daemon.py` corre `ccusage`, saca el total de tokens del día, le suma tus límites
+y lo manda al dongle por el puerto serie USB. Pensado para Debian 13, anda en cualquier Linux.
+
+Se usa de dos formas:
+
+| Modo | Cómo | Cuándo se actualiza |
+|---|---|---|
+| **Sin daemon** (recomendado) | lo dispara la [status line](../statusline/README.md) con `--push` | cada vez que Claude Code responde |
+| **Daemon** | servicio systemd, ver abajo | cada 10 s, uses o no Claude |
+
+Si usás el modo daemon, instalá la status line con `install.py --no-push` para que no
+se peleen por el puerto.
 
 ## Requisitos
 
@@ -46,11 +56,12 @@ sudo udevadm control --reload && sudo udevadm trigger
 | `--led-source` | `limits` | qué maneja el semáforo: `limits` (los reales, si hay datos) o `budget` |
 | `--dry-run` | off | imprime el payload en vez de mandarlo |
 | `--once` | off | una vuelta y sale |
+| `--push` | off | modo sin daemon: una actualización con candado y antirrebote (lo usa la status line) |
 | `-v` | off | logs de debug (incluye lo que responde el dongle) |
 
 Si desenchufás el dongle, el daemon sigue corriendo y se reconecta solo cuando vuelve.
 
-## Como servicio systemd (de usuario)
+## Modo daemon: servicio systemd (de usuario)
 
 Va como servicio **de usuario** porque `ccusage` tiene que leer tu `~/.claude`.
 

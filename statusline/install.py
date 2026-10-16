@@ -47,6 +47,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--settings", default=os.path.expanduser("~/.claude/settings.json"))
     ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--no-push", action="store_true",
+                    help="no actualizar el dongle desde la status line (si usás el daemon)")
     args = ap.parse_args()
 
     settings: dict = {}
@@ -80,6 +82,8 @@ def main() -> int:
             previous = current or None
             save_previous(previous)
         cmd = f"python3 {shlex.quote(SCRIPT)}"
+        if args.no_push:
+            cmd += " --no-push"
         prev_cmd = (previous or {}).get("command") if (previous or {}).get("type") == "command" else None
         if prev_cmd:
             cmd += f" --wrap {shlex.quote(prev_cmd)}"

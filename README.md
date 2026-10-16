@@ -1,15 +1,17 @@
 # token-dongle
 
-Monitor de consumo de tokens de Claude Code en un **LILYGO T-Dongle-C5** (ESP32-C5): un daemon
-lee `ccusage` y manda los datos por serial a la pantalla TFT, con el LED RGB como semáforo de gasto.
+Monitor de consumo de tokens de Claude Code en un **LILYGO T-Dongle-C5** (ESP32-C5): cada vez
+que Claude responde, la PC lee `ccusage` y tus límites, y se los manda por serial al dongle,
+que los muestra en la pantalla con Clawd y usa el LED RGB como semáforo. **Sin daemon.**
 
 ```
-┌──────────────── PC (Debian 13) ─────────────────┐            ┌──── T-Dongle-C5 ────┐
-│ ~/.claude/*.jsonl ──► ccusage daily --json      │  USB       │ HWCDC (Serial)      │
-│                         │                       │  Serial/   │   │ JSON por línea  │
-│ claude_token_daemon.py ─┴─► {"day_tokens":…}\n ─┼──JTAG────► │   ▼                 │
-│   (systemd --user, cada 10 s)                   │            │ ST7735 80x160 + LED │
-└─────────────────────────────────────────────────┘            └─────────────────────┘
+┌─────────────────────── PC (Linux) ───────────────────────┐            ┌──── T-Dongle-C5 ────┐
+│ Claude Code responde                                     │            │                     │
+│   └─► status line (dongle_statusline.py)                 │  USB       │ HWCDC (Serial)      │
+│         ├─ guarda límites 5h/semana (rate_limits)        │  Serial/   │   │ JSON por línea  │
+│         └─► claude_token_daemon.py --push (de fondo) ────┼──JTAG────► │   ▼                 │
+│               └─ ccusage daily --json                    │            │ ST7735 80x160 + LED │
+└──────────────────────────────────────────────────────────┘            └─────────────────────┘
 ```
 
 - **Sin USB-HID**: el ESP32-C5 solo tiene USB Serial/JTAG, así que todo va por serie (CDC).
@@ -21,9 +23,9 @@ lee `ccusage` y manda los datos por serial a la pantalla TFT, con el LED RGB com
 
 | Carpeta | Qué hay |
 |---|---|
-| [`daemon/`](daemon/README.md) | Script Python + servicio systemd + regla udev |
+| [`daemon/`](daemon/README.md) | Script que arma y manda los datos (`--push`), o daemon opcional + regla udev |
 | [`firmware/`](firmware/README.md) | Proyecto PlatformIO para el dongle |
-| [`statusline/`](statusline/README.md) | Status line de Claude Code que pasa los límites 5h/semana (opcional) |
+| [`statusline/`](statusline/README.md) | Status line de Claude Code: dispara las actualizaciones y pasa los límites 5h/semana |
 
 ## Qué necesitás
 
@@ -42,8 +44,8 @@ git clone https://github.com/maxi018/token-dongle ~/token-dongle
 cd ~/token-dongle
 ```
 
-> Clonalo en `~/token-dongle`: el servicio systemd usa esa ruta. Si lo ponés en otro lado,
-> editá `ExecStart` en `daemon/claude-token-monitor.service`.
+> Podés clonarlo donde quieras, pero no lo muevas después: Claude Code guarda la ruta
+> al instalar la status line (si lo movés, volvé a correr `statusline/install.py`).
 
 ### 2. Dependencias de la PC
 
@@ -72,38 +74,44 @@ Si no engancha: desenchufalo, mantené **BOOT** apretado, enchufalo, soltá y re
 Al terminar, desenchufá y volvé a enchufar. Tenés que ver el LED **rojo → verde → azul**
 y a Clawd durmiendo con "esperando PC...".
 
-### 4. Arrancar el daemon
-
-```bash
-./daemon/claude_token_daemon.py -v
-```
-
-A los ~10 segundos aparece tu consumo de hoy. Si funciona, dejalo como servicio para no
-tener que acordarte más (arranca solo al iniciar sesión):
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp daemon/claude-token-monitor.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now claude-token-monitor
-```
-
-### 5. (Opcional) Barras de límites 5h / semanal
+### 4. Conectarlo con Claude Code
 
 ```bash
 python3 statusline/install.py
 ```
 
-Abrí Claude Code, mandá un mensaje y en unos segundos aparecen las barras.
-Detalles en [`statusline/README.md`](statusline/README.md).
+Eso es todo: **no hay que dejar nada corriendo**. Abrí Claude Code, mandale un mensaje y a
+los pocos segundos el dongle muestra tu consumo (y las barras de límites si tenés Pro/Max).
+Desde ahí se actualiza solo cada vez que Claude responde.
+
+> Si ya tenías una status line, el instalador la conserva. Detalles en
+> [`statusline/README.md`](statusline/README.md).
+
+<details>
+<summary>¿Preferís que se actualice cada 10 s aunque no uses Claude Code? (modo daemon)</summary>
+
+Sirve si usás Claude Code desde VS Code/JetBrains (si ahí no se actualiza el dongle) o querés
+ver el número moverse sin estar en la terminal.
+
+```bash
+python3 statusline/install.py --no-push        # la status line solo guarda los límites
+mkdir -p ~/.config/systemd/user
+cp daemon/claude-token-monitor.service ~/.config/systemd/user/   # ajustá la ruta en ExecStart
+systemctl --user daemon-reload && systemctl --user enable --now claude-token-monitor
+```
+
+Ver [`daemon/README.md`](daemon/README.md).
+</details>
 
 ### Si algo falla
 
 | Síntoma | Solución |
 |---|---|
 | `Permission denied` en el puerto | no cerraste sesión después del `usermod` (chequeá con `groups`) |
-| `Device or resource busy` | otro programa tiene el puerto: frená el daemon (`systemctl --user stop claude-token-monitor`) |
+| `Device or resource busy` | otro programa tiene el puerto (monitor serie, o el daemon si lo instalaste) |
 | Imagen dada vuelta | cambiá `TFT_ROTATION` a `3` en `firmware/src/main.cpp` y compilá (opción B) |
-| Queda en "esperando PC" | corré el daemon con `-v` y fijate qué dice |
+| Queda en "esperando PC" | mirá `~/.cache/token-dongle/push.log`, o probá a mano: `./daemon/claude_token_daemon.py --once -v` |
+| No se actualiza | ¿estás usando Claude Code en la terminal? Fijate que abajo diga `🦀 …` (la status line) |
 | Muestra 0 tokens | es normal si hoy todavía no usaste Claude Code en esta PC |
 
 ## Protocolo PC → dongle
@@ -118,10 +126,13 @@ que no conoce, así que las fases nuevas pueden agregar campos sin romper firmwa
 | `date` | `"YYYY-MM-DD"` | 1 | día al que corresponde |
 | `lvl` | float | 2 | qué tan cerca del límite estás: maneja LED y humor de Clawd (`0.6` amarillo, `1.0` rojo). Opcional |
 | `s5`, `s7` | int | 2 | % usado de la ventana de 5 h y de la semanal (límites oficiales Pro/Max). Opcional |
-| `r5` | int | 2 | segundos hasta que resetea la ventana de 5 h. Opcional |
-| `lim_age` | int | 2 | antigüedad de los límites en segundos (más de 30 min = barras grises). Opcional |
+| `r5`, `r7` | int | 2 | segundos hasta que resetea la ventana de 5 h / la semanal. Opcional |
+| `lvl_lim` | int | 2 | `1` si `lvl` sale de los límites: el dongle lo recalcula cuando una ventana resetea. Opcional |
+| `lim_age` | int | 2 | antigüedad de los límites en segundos (más de 1 h = barras grises). Opcional |
 
-Si pasan más de 35 s sin mensajes válidos, el dongle muestra **SIN DATOS** en rojo.
+Los mensajes llegan cuando Claude responde (o cada 10 s con el daemon): que pasen horas sin
+datos es normal. El pie muestra hace cuánto llegó el último, y el dongle descuenta solo los
+resets de las ventanas (`r5`/`r7`) para poner la barra en 0% cuando corresponde.
 
 ## Fuente de datos
 
@@ -159,11 +170,12 @@ te queda de verdad", porque los límites son compartidos entre todos los lugares
 | Entraron tokens nuevos | camina y salta ~12 s | flash blanco |
 | Cerca del límite | suda una gotita | amarillo → rojo |
 | Límite al 90% o más (o presupuesto pasado) | tiembla y suda a mares | rojo latiendo rápido |
-| Daemon sin mandar > 35 s | duerme, pie "SIN DATOS" en rojo | violeta respirando |
+| 10 min sin usar Claude | se duerme (zZ) | mismo color, respiración muy tenue |
 
 El semáforo sigue **el peor de tus límites reales** (5h o semanal): amarillo desde ~54% y rojo
-desde 90%. Si no instalaste la status line (o no tenés plan Pro/Max), usa el presupuesto del
-daemon (`--budget-usd`, default 50; o `--budget-tokens`). Con `--led-source budget` forzás el presupuesto.
+desde 90%. Sin plan Pro/Max usa un presupuesto diario (`--budget-usd`, default 50; o
+`--budget-tokens`). Para cambiarlo, pasale opciones a la status line, por ejemplo en
+`~/.claude/settings.json`: `... dongle_statusline.py --push-args "--offline --budget-usd 20"`.
 El botón **BOOT** del dongle cicla el LED: normal → tenue → apagado.
 
 ## Hardware: dos cosas a saber

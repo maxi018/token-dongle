@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Claude Token Monitor — daemon de PC.
+"""Claude Token Monitor — envío de datos al dongle.
 
-Cada N segundos corre `ccusage daily --json` para el día de hoy, saca el total
+Dos formas de usarlo:
+
+- Sin daemon (recomendado): la status line de Claude Code ejecuta `--push` después de
+  cada respuesta. No queda nada corriendo de fondo.
+- Como daemon: cada N segundos corre `ccusage daily --json` para el día de hoy, saca el total
 de tokens y lo manda al T-Dongle-C5 por el puerto serie USB (USB Serial/JTAG del
 ESP32-C5) como una línea JSON:
 
@@ -14,7 +18,8 @@ límites oficiales de la cuenta (Pro/Max) que Claude Code guarda en
 ~/.cache/token-dongle/limits.json:
 
     "s5": 23, "s7": 41    % usado de la ventana de 5 h y de la semanal
-    "r5": 7800            segundos hasta que resetea la ventana de 5 h
+    "r5": 7800, "r7": ... segundos hasta que resetea cada ventana
+    "lvl_lim": 1          el lvl sale de los límites (el dongle lo recalcula al resetear)
     "lim_age": 120        segundos desde que Claude Code actualizó esos datos
 
 Estructura de `ccusage daily --json` verificada con ccusage 20.0.31:
@@ -30,6 +35,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import fcntl
 import logging
 import os
 import shlex
@@ -135,8 +141,8 @@ def read_limits(path: str, now: float | None = None) -> dict | None:
         expired = resets_at and resets_at <= now
         # Ventana vencida = arrancó una nueva; sin uso visto todavía, vale 0%.
         out[key] = 0 if expired else round(float(w.get("used_percentage", 0)))
-        if name == "five_hour" and resets_at and not expired:
-            out["r5"] = int(resets_at - now)
+        if resets_at and not expired:
+            out["r5" if name == "five_hour" else "r7"] = int(resets_at - now)
     if not out:
         return None
     out["lim_age"] = max(0, int(now - int(saved.get("updated_at") or now)))
@@ -150,6 +156,7 @@ def apply_limits(payload: dict, limits: dict | None, led_source: str) -> None:
     if led_source == "limits":
         worst = max(limits.get("s5", 0), limits.get("s7", 0))
         payload["lvl"] = round(worst / LIMIT_RED_AT, 3)
+        payload["lvl_lim"] = 1
 
 
 # ---------------------------------------------------------------------- serial
@@ -212,6 +219,72 @@ class DongleLink:
         self.ser = None
 
 
+# ------------------------------------------------------------------------ push
+
+STATE_DIR = os.path.dirname(DEFAULT_LIMITS_FILE)
+# Como mucho un ccusage cada tantos segundos aunque Claude responda más seguido.
+PUSH_MIN_INTERVAL = 10.0
+
+
+def _try_lock(path: str, blocking: bool):
+    f = open(path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return f
+    except OSError:
+        f.close()
+        return None
+
+
+def push_once(args, base_cmd: list[str]) -> int:
+    """Una actualización y listo. Pensado para que lo dispare la status line.
+
+    Puede haber muchas respuestas seguidas, así que hay a lo sumo un proceso mandando
+    y uno esperando su turno; el resto sale enseguida. El que espera manda datos frescos
+    al terminar el anterior, así nunca se pierde la última actualización.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    waiter = _try_lock(os.path.join(STATE_DIR, "push.wait.lock"), blocking=False)
+    if waiter is None:
+        return 0  # ya hay uno haciendo fila: se encarga él
+    runner = _try_lock(os.path.join(STATE_DIR, "push.run.lock"), blocking=True)
+    waiter.close()  # liberamos la fila para el próximo
+
+    stamp = os.path.join(STATE_DIR, "push.last")
+    try:
+        wait = PUSH_MIN_INTERVAL - (time.time() - os.path.getmtime(stamp))
+    except OSError:
+        wait = 0
+    if wait > 0:
+        time.sleep(wait)
+
+    port = args.port or find_dongle_port()
+    if not port and not args.dry_run:
+        log.info("dongle no enchufado; nada que hacer")
+        return 0
+    try:
+        payload = fetch_today(base_cmd, args.offline, args.timeout, args.budget_usd, args.budget_tokens)
+        apply_limits(payload, read_limits(args.limits_file), args.led_source)
+    except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        log.error("falló ccusage: %s", e)
+        return 1
+    finally:
+        with open(stamp, "w"):
+            pass
+
+    if args.dry_run:
+        print(json.dumps(payload, separators=(",", ":")), flush=True)
+    else:
+        link = DongleLink(port)
+        ok = link.send(payload)
+        link.close()
+        if not ok:
+            return 1
+    log.info("enviado: %s", json.dumps(payload, separators=(",", ":")))
+    runner.close()
+    return 0
+
+
 # ------------------------------------------------------------------------ main
 
 
@@ -232,6 +305,8 @@ def main() -> int:
                     help="qué maneja el semáforo: los límites reales (default, si hay datos) o el presupuesto")
     ap.add_argument("--dry-run", action="store_true", help="no abre el serial, solo imprime el payload")
     ap.add_argument("--once", action="store_true", help="una sola vuelta y sale")
+    ap.add_argument("--push", action="store_true",
+                    help="modo sin daemon: una actualización con candado/antirrebote (lo usa la status line)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -241,6 +316,8 @@ def main() -> int:
     )
 
     base_cmd = shlex.split(args.ccusage_cmd) if args.ccusage_cmd else default_ccusage_cmd()
+    if args.push:
+        return push_once(args, base_cmd)
     log.info("usando ccusage: %s", shlex.join(base_cmd))
 
     link = None if args.dry_run else DongleLink(args.port)
@@ -273,7 +350,7 @@ def main() -> int:
             )
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
             # No mandamos nada: el dongle mantiene el último número y su
-            # "SIN DATOS hace Xs" deja ver que algo anda mal.
+            # "hace Xm" deja ver que no está llegando nada nuevo.
             log.error("falló ccusage: %s", e)
 
         if payload is not None:

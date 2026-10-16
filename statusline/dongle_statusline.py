@@ -11,8 +11,11 @@ Claude Code le da a su status line un JSON por stdin; para suscriptores Pro/Max 
 (https://code.claude.com/docs/en/statusline#rate-limit-usage). Son los porcentajes
 oficiales de tu cuenta, los mismos que muestra /usage. Este script:
 
-1. Guarda esas ventanas en ~/.cache/token-dongle/limits.json (lo lee el daemon).
-2. Imprime una status line. Si ya tenías una, pasala con --wrap y se sigue viendo la tuya.
+1. Guarda esas ventanas en ~/.cache/token-dongle/limits.json.
+2. Dispara en segundo plano `daemon/claude_token_daemon.py --push`, que corre ccusage y le
+   manda todo al dongle. Así no hace falta dejar un daemon corriendo: el dongle se actualiza
+   cada vez que Claude responde. (Desactivable con --no-push si preferís el daemon.)
+3. Imprime una status line. Si ya tenías una, pasala con --wrap y se sigue viendo la tuya.
 
 Nunca debe romper la status line: cualquier error se traga en silencio.
 """
@@ -22,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -31,6 +35,29 @@ DEFAULT_FILE = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "token-dongle", "limits.json"
 )
 WINDOWS = ("five_hour", "seven_day")
+PUSH_SCRIPT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "daemon", "claude_token_daemon.py")
+)
+PUSH_LOG = os.path.join(os.path.dirname(DEFAULT_FILE), "push.log")
+
+
+def spawn_push(extra_args: str) -> None:
+    """Lanza el envío al dongle desacoplado: la status line no espera a ccusage."""
+    os.makedirs(os.path.dirname(PUSH_LOG), exist_ok=True)
+    try:
+        if os.path.getsize(PUSH_LOG) > 256 * 1024:
+            os.truncate(PUSH_LOG, 0)
+    except OSError:
+        pass
+    with open(PUSH_LOG, "a") as logf:
+        subprocess.Popen(
+            [sys.executable, PUSH_SCRIPT, "--push", *shlex.split(extra_args)],
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=logf,
+            start_new_session=True,  # sobrevive aunque Claude Code corte la status line
+            close_fds=True,
+        )
 
 
 def save_limits(data: dict, path: str) -> dict:
@@ -81,6 +108,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", default=DEFAULT_FILE, help="dónde guardar los límites")
     ap.add_argument("--wrap", help="tu status line anterior: se ejecuta con el mismo JSON y se muestra su salida")
+    ap.add_argument("--no-push", action="store_true", help="no mandar al dongle (si usás el daemon)")
+    ap.add_argument("--push-args", default="--offline",
+                    help='opciones para el envío, ej. "--offline --budget-usd 20" (default: --offline)')
     args = ap.parse_args()
 
     raw = sys.stdin.read()
@@ -91,6 +121,11 @@ def main() -> int:
         limits = save_limits(data, args.file)
     except Exception:
         pass
+    if not args.no_push and os.path.exists(PUSH_SCRIPT):
+        try:
+            spawn_push(args.push_args)
+        except Exception:
+            pass
 
     if args.wrap:
         try:

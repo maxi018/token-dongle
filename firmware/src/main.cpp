@@ -2,13 +2,17 @@
 // Recibe por USB Serial/JTAG una línea JSON por actualización, muestra el total de
 // tokens del día con Clawd animado al lado y usa el LED APA102 como semáforo.
 //
+// Las actualizaciones llegan cuando Claude Code responde (vía la status line) o cada 10 s
+// si corrés el daemon. Que pasen horas sin datos es normal: no estás usando Claude.
+//
 // Protocolo (una línea por mensaje, terminada en '\n'):
 //   {"v":1,"day_tokens":591725,"date":"2026-10-14","lvl":0.42}
-// lvl = qué tan cerca estás del límite (la calcula el daemon; 0.6 amarillo, 1.0 rojo).
-// Opcionales, si la status line de Claude Code está instalada (límites oficiales Pro/Max):
+// lvl = qué tan cerca estás del límite (0.6 amarillo, 1.0 rojo).
+// Opcionales, con los límites oficiales de la cuenta (Pro/Max):
 //   "s5":23,"s7":41   % usado de la ventana de 5 h y de la semanal
-//   "r5":7800         segundos hasta que resetea la de 5 h
+//   "r5":7800,"r7":9e4 segundos hasta que resetea cada ventana
 //   "lim_age":120     antigüedad de esos datos en segundos
+//   "lvl_lim":1       lvl sale de los límites: el dongle lo recalcula solo cuando una ventana resetea
 // Las claves desconocidas se ignoran.
 
 #include <Arduino.h>
@@ -29,8 +33,8 @@
 // Si la ves dada vuelta, cambiá a 3.
 #define TFT_ROTATION 1
 
-// Si no llega nada en este tiempo, avisamos en pantalla que el daemon no responde.
-static const uint32_t STALE_AFTER_MS = 35 * 1000;
+// Si no se usó Claude en este tiempo, Clawd se va a dormir.
+static const uint32_t SLEEP_AFTER_MS = 10UL * 60 * 1000;
 // Cuánto tiempo Clawd sigue "trabajando" después de que suben los tokens.
 static const uint32_t WORKING_FOR_MS = 12 * 1000;
 static const uint32_t FRAME_MS = 50;  // ~20 fps
@@ -39,9 +43,11 @@ static const size_t RX_LINE_MAX = 512;
 // Umbrales del semáforo (fracción del presupuesto diario)
 static const float LVL_YELLOW = 0.6f;
 static const float LVL_RED = 1.0f;
+// Con los límites reales el rojo arranca al 90% (al 100% Claude ya te frena). Igual que el daemon.
+static const float LIMIT_RED_AT = 90.0f;
 // Las barras de límites se pintan de gris si los datos tienen más de esto
 // (Claude Code solo los actualiza mientras lo usás).
-static const uint32_t LIMITS_OLD_AFTER_S = 30 * 60;
+static const uint32_t LIMITS_OLD_AFTER_S = 60 * 60;
 
 SPIClass &lcdSpi = SPI;
 Adafruit_ST7735 tft(&lcdSpi, PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST);
@@ -52,14 +58,16 @@ Apa102Led led(PIN_LED_DI, PIN_LED_CI);
 struct State {
   bool hasData = false;
   uint64_t dayTokens = 0;
-  float lvl = -1.0f;         // < 0: el daemon no mandó presupuesto
+  float lvl = -1.0f;         // < 0: no hay presupuesto ni límites
+  bool lvlFromLimits = false;
   char date[11] = "";        // "YYYY-MM-DD"
   uint32_t lastRxMs = 0;
   uint32_t lastActivityMs = 0;
   bool everActive = false;
+  uint32_t lastUseMs = 0;    // último uso visto (o el primer dato): para dormir a Clawd
   // Límites oficiales (vía status line). < 0 = desconocido.
   int16_t s5 = -1, s7 = -1;
-  int32_t r5 = -1;       // segundos hasta el reset de 5 h, al momento de recibirlo
+  int32_t r5 = -1, r7 = -1;  // segundos hasta cada reset, al momento de recibirlos
   uint32_t limAge = 0;   // antigüedad de los límites al momento de recibirlos
 } state;
 
@@ -70,7 +78,29 @@ static char lineBuf[RX_LINE_MAX + 1];
 static size_t lineLen = 0;
 static bool lineOverflow = false;
 
-static bool isStale(uint32_t now) { return now - state.lastRxMs > STALE_AFTER_MS; }
+static bool isAsleep(uint32_t now) { return !state.hasData || now - state.lastUseMs > SLEEP_AFTER_MS; }
+
+static uint32_t sinceRxS(uint32_t now) { return (now - state.lastRxMs) / 1000; }
+
+// Segundos que faltan para un reset (-1 = desconocido o ya pasó).
+static int32_t remainingS(int32_t r, uint32_t now) {
+  if (r < 0) return -1;
+  int32_t left = r - (int32_t)sinceRxS(now);
+  return left > 0 ? left : -1;
+}
+
+// % de una ventana teniendo en cuenta que, si ya reseteó, arrancó de cero.
+static int16_t effectivePct(int16_t pct, int32_t r, uint32_t now) {
+  if (pct < 0) return -1;
+  if (r >= 0 && remainingS(r, now) < 0) return 0;
+  return pct;
+}
+
+static float currentLvl(uint32_t now) {
+  if (!state.lvlFromLimits) return state.lvl;
+  int16_t a = effectivePct(state.s5, state.r5, now), b = effectivePct(state.s7, state.r7, now);
+  return (float)max(a, b) / LIMIT_RED_AT;
+}
 
 // ---------------------------------------------------------------- formato
 
@@ -167,10 +197,11 @@ static void drawLimitBar(const char *label, int16_t pct, int16_t x, int16_t y, b
 }
 
 static ClawdMood currentMood(uint32_t now) {
-  if (!state.hasData || isStale(now)) return ClawdMood::Sleeping;
-  if (state.lvl >= LVL_RED) return ClawdMood::Panic;
+  float lvl = currentLvl(now);
   if (state.everActive && now - state.lastActivityMs < WORKING_FOR_MS) return ClawdMood::Working;
-  if (state.lvl >= LVL_YELLOW) return ClawdMood::Sweating;
+  if (isAsleep(now)) return ClawdMood::Sleeping;
+  if (lvl >= LVL_RED) return ClawdMood::Panic;
+  if (lvl >= LVL_YELLOW) return ClawdMood::Sweating;
   return ClawdMood::Idle;
 }
 
@@ -203,10 +234,9 @@ static void render(uint32_t now) {
   if (state.hasData) {
     drawTokens(state.dayTokens, numX, numW, showLimits ? 40 : 52);
     if (showLimits) {
-      uint32_t ageS = state.limAge + (now - state.lastRxMs) / 1000;
-      bool old = ageS > LIMITS_OLD_AFTER_S;
-      drawLimitBar("5h", state.s5, numX, 47, old);
-      drawLimitBar("sem", state.s7, numX, 58, old);
+      bool old = state.limAge + sinceRxS(now) > LIMITS_OLD_AFTER_S;
+      drawLimitBar("5h", effectivePct(state.s5, state.r5, now), numX, 47, old);
+      drawLimitBar("sem", effectivePct(state.s7, state.r7, now), numX, 58, old);
     }
   } else {
     canvas.setFont(&FreeSansBold9pt7b);
@@ -218,24 +248,21 @@ static void render(uint32_t now) {
     canvas.setFont(nullptr);
   }
 
-  // Pie: antigüedad del dato + % del presupuesto
+  // Pie: antigüedad del dato + reset de 5 h (o % del presupuesto)
   char foot[32];
-  uint16_t footColor = 0x8410;
   if (!state.hasData) {
-    snprintf(foot, sizeof(foot), "corre el daemon :)");
+    snprintf(foot, sizeof(foot), "usa Claude Code :)");
   } else {
-    unsigned long age = (now - state.lastRxMs) / 1000;
-    if (isStale(now)) {
-      snprintf(foot, sizeof(foot), "SIN DATOS %lus", age);
-      footColor = ST77XX_RED;
-    } else {
-      snprintf(foot, sizeof(foot), "hace %lus", age);
-    }
+    uint32_t age = sinceRxS(now);
+    if (age < 60) snprintf(foot, sizeof(foot), "hace %lus", (unsigned long)age);
+    else if (age < 3600) snprintf(foot, sizeof(foot), "hace %lum", (unsigned long)(age / 60));
+    else snprintf(foot, sizeof(foot), "hace %luh", (unsigned long)(age / 3600));
   }
-  canvas.setTextColor(footColor);
+  canvas.setTextColor(0x8410);
   canvas.setCursor(2, 71);
   canvas.print(foot);
-  int32_t resetS = state.r5 >= 0 ? state.r5 - (int32_t)((now - state.lastRxMs) / 1000) : -1;
+  int32_t resetS = remainingS(state.r5, now);
+  float lvl = currentLvl(now);
   if (showLimits && resetS > 0) {
     // Cuándo se libera la ventana de 5 h
     char rs[16];
@@ -243,10 +270,10 @@ static void render(uint32_t now) {
     canvas.setTextColor(0x8410);
     canvas.setCursor(canvas.width() - (int16_t)strlen(rs) * 6 - 2, 71);
     canvas.print(rs);
-  } else if (state.hasData && state.lvl >= 0 && !showLimits) {
+  } else if (state.hasData && lvl >= 0 && !showLimits) {
     char pct[12];
-    snprintf(pct, sizeof(pct), "%d%%", (int)(state.lvl * 100.0f + 0.5f));
-    uint16_t c = state.lvl >= LVL_RED ? ST77XX_RED : state.lvl >= LVL_YELLOW ? ST77XX_YELLOW : ST77XX_GREEN;
+    snprintf(pct, sizeof(pct), "%d%%", (int)(lvl * 100.0f + 0.5f));
+    uint16_t c = lvl >= LVL_RED ? ST77XX_RED : lvl >= LVL_YELLOW ? ST77XX_YELLOW : ST77XX_GREEN;
     canvas.setTextColor(c);
     canvas.setCursor(canvas.width() - (int16_t)strlen(pct) * 6 - 2, 71);
     canvas.print(pct);
@@ -295,15 +322,16 @@ static void updateLed(uint32_t now) {
   uint8_t r, g, b;
   float k;  // intensidad 0..1
 
+  float lvl = currentLvl(now);
   if (!state.hasData) {
-    r = 0, g = 60, b = 255;  // azul: esperando al daemon
+    r = 0, g = 60, b = 255;  // azul: todavía no llegó nada
     k = 0.15f + 0.85f * wave(now, 3000);
-  } else if (isStale(now)) {
-    r = 160, g = 0, b = 255;  // violeta: el daemon dejó de mandar
-    k = 0.1f + 0.9f * wave(now, 5000);
+  } else if (isAsleep(now)) {
+    levelColor(lvl, r, g, b);  // Clawd duerme: mismo color, respiración muy tenue
+    k = 0.04f + 0.3f * wave(now, 6000);
   } else {
-    levelColor(state.lvl, r, g, b);
-    if (state.lvl >= LVL_RED) {
+    levelColor(lvl, r, g, b);
+    if (lvl >= LVL_RED) {
       k = 0.2f + 0.8f * wave(now, 700);  // rojo latiendo rápido
     } else {
       k = 0.55f + 0.45f * wave(now, 4000);  // respiración suave
@@ -353,13 +381,18 @@ static void handleLine(const char *line) {
   // Subieron los tokens del mismo día => Clawd se pone a laburar.
   if (state.hasData && newTokens > state.dayTokens && strcmp(date, state.date) == 0) {
     state.lastActivityMs = now;
+    state.lastUseMs = now;
     state.everActive = true;
   }
+  // Primer dato o día nuevo: cuenta como uso (si no, Clawd arrancaría dormido).
+  if (!state.hasData || strcmp(date, state.date) != 0) state.lastUseMs = now;
   state.dayTokens = newTokens;
   state.lvl = doc["lvl"] | -1.0f;
+  state.lvlFromLimits = (doc["lvl_lim"] | 0) != 0;
   state.s5 = doc["s5"] | -1;
   state.s7 = doc["s7"] | -1;
   state.r5 = doc["r5"] | -1;
+  state.r7 = doc["r7"] | -1;
   state.limAge = doc["lim_age"] | 0;
   strlcpy(state.date, date, sizeof(state.date));
   state.hasData = true;
